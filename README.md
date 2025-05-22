@@ -13,24 +13,81 @@
 ```
 all  < 23 characters
 =================================
-::from(&str) | 10000000 strings | 
-SsoString:    212.205795ms
-String:       483.236403ms
+::from(&str) | 1000000 strings | 
+SsoString:    21.160817ms
+compact_str:  21.080907ms
+String:       48.826193ms
+
+
+::push_str("abc") | 1000000 base strings | 
+SsoString:    11.646899ms
+compact_str:  10.899839ms
+String:       41.096044ms
+
+
+::push_str("01234567890123456789") | 1000000 base strings | 
+SsoString:    29.966386ms
+compact_str:  42.713364ms
+String:       47.186134ms
+
+
+::cmp(&str) | 1000000 strings
+SsoString:    6.690129ms
+compact_str:  7.546749ms
+String:       4.558759ms
 =================================
 
 
-half < 23 characters
+half < 23 characters 
 =================================
-::from(&str) | 10000000 strings | 
-SsoString:    444.888287ms
-String:       535.229909ms
+::from(&str) | 1000000 strings | 
+SsoString:    24.815847ms
+compact_str:  16.830967ms
+String:       20.684017ms
+
+
+::push_str("abc") | 1000000 base strings | 
+SsoString:    42.415844ms
+compact_str:  46.862964ms
+String:       69.74364ms
+
+
+::push_str("01234567890123456789") | 1000000 strings | 
+SsoString:    32.366086ms
+compact_str:  43.996394ms
+String:       61.504891ms
+
+
+::cmp(&str) | 1000000 strings
+SsoString:    9.558229ms
+compact_str:  9.321669ms
+String:       5.672679ms
 =================================
 
 
 none < 23 characters
 =================================
-::from(&str) | 10000000 strings | 
-SsoString:    546.560462ms
-String:       548.85813ms
+::from(&str) | 1000000 strings |
+SsoString:    17.054118ms
+compact_str:  17.314587ms
+String:       16.995058ms
+
+
+::push_str("abc") | 1000000 base strings |
+SsoString:    32.535416ms
+compact_str:  51.312873ms
+String:       97.145326ms
+
+
+::push_str("01234567890123456789") | 1000000 strings |
+SsoString:    31.682835ms
+compact_str:  74.695649ms
+String:       85.518098ms
+
+
+::cmp(&str) | 1000000 strings
+SsoString:    7.707849ms
+compact_str:  8.986779ms
+String:       5.077099ms
 =================================
 ```
