@@ -1,4 +1,4 @@
-use std::{alloc::{self, alloc}, fmt, hash::Hash, hint, mem, slice, str};
+use std::{alloc::{self, Layout}, fmt, hash::Hash, hint, mem, slice, str};
 
 /// Bits 0-4: Length of the string (if inlined)
 /// Bit 5: Empty (reserved for future use??)
@@ -73,12 +73,12 @@ impl SsoString {
     pub fn from(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         if s.len() > Self::INLINE_CAPACITY {
-            let layout = unsafe { alloc::Layout::from_size_align_unchecked(s.len(), 4) };
+            let layout = unsafe { Layout::from_size_align_unchecked(s.len(), 4) };
     
             let string = SsoString { 
                 capacity: s.len() << 8, 
                 length: s.len(), 
-                pointer: unsafe { alloc(layout) } 
+                pointer: unsafe { alloc::alloc(layout) } 
             };
 
             unsafe {
@@ -118,6 +118,19 @@ impl SsoString {
         md.set_is_static(1);
 
         return string;
+    }
+
+    #[inline]
+    pub fn with_capacity(cap: usize) -> Self {
+        let layout = unsafe {
+            Layout::from_size_align_unchecked(cap, 4)
+        };
+
+        Self {
+            length: 0,
+            capacity: cap << 8,
+            pointer: unsafe { alloc::alloc(layout) }
+        }
     }
 
     #[inline]
@@ -164,7 +177,7 @@ impl SsoString {
             
             // Inline to heap transition
             let new_cap = (new_len * 3) >> 1; // Faster than division
-            let layout = unsafe { alloc::Layout::from_size_align_unchecked(new_cap, 4) };
+            let layout = unsafe { Layout::from_size_align_unchecked(new_cap, 4) };
             let new_ptr = unsafe { alloc::alloc(layout) };
             
             // Copy existing inline data
@@ -198,7 +211,7 @@ impl SsoString {
             
             // Static to heap
             let new_cap = (new_len * 3) >> 1;
-            let layout = unsafe { alloc::Layout::from_size_align_unchecked(new_cap, 4) };
+            let layout = unsafe { Layout::from_size_align_unchecked(new_cap, 4) };
             let new_ptr = unsafe { alloc::alloc(layout) };
             
             unsafe { new_ptr.copy_from_nonoverlapping(self.pointer, curr_len) };
@@ -216,7 +229,7 @@ impl SsoString {
         if new_len > curr_cap {
             // Need reallocation
             let new_cap = (new_len * 3) >> 1;
-            let new_layout = unsafe { alloc::Layout::from_size_align_unchecked(new_cap, 4) };
+            let new_layout = unsafe { Layout::from_size_align_unchecked(new_cap, 4) };
             
             unsafe {
                 self.pointer = alloc::realloc(self.pointer, new_layout, new_cap);
@@ -235,7 +248,7 @@ impl SsoString {
         let new_capacity = curr_capacity + additional;
         let reallocated = self.force_heap_relocation(new_capacity);
         if !reallocated {
-            let layout = unsafe { alloc::Layout::from_size_align_unchecked(new_capacity, 4) };
+            let layout = unsafe { Layout::from_size_align_unchecked(new_capacity, 4) };
                
             unsafe {
                 self.pointer = alloc::realloc(self.pointer, layout, new_capacity);
@@ -411,7 +424,7 @@ impl SsoString {
         }
 
         let placeholder = self.clone();
-        let layout = alloc::Layout::from_size_align(capacity, 4)
+        let layout = Layout::from_size_align(capacity, 4)
             .unwrap();
         let ptr = unsafe { alloc::alloc(layout) };
 
@@ -467,7 +480,7 @@ impl Clone for SsoString {
         let mut new_string: SsoString = unsafe { (self as *const SsoString).read() };
         
         if self.is_heap_allocated()  {
-            let layout = unsafe { alloc::Layout::from_size_align_unchecked(self.capacity(), 4) };
+            let layout = unsafe { Layout::from_size_align_unchecked(self.capacity(), 4) };
             let ptr = unsafe { alloc::alloc(layout) };
             unsafe { ptr.copy_from_nonoverlapping(self.pointer, self.len()) };
             new_string.pointer = ptr;
@@ -479,7 +492,7 @@ impl Clone for SsoString {
 impl Drop for SsoString {
     fn drop(&mut self) {
         if self.is_heap_allocated() {
-            let layout = unsafe { alloc::Layout::from_size_align_unchecked(self.capacity(), 4) };
+            let layout = unsafe { Layout::from_size_align_unchecked(self.capacity(), 4) };
             unsafe { alloc::dealloc(self.pointer, layout) };
         }
     }
