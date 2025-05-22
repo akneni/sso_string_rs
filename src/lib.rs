@@ -216,14 +216,12 @@ impl SsoString {
         if new_len > curr_cap {
             // Need reallocation
             let new_cap = (new_len * 3) >> 1;
-            let old_layout = unsafe { alloc::Layout::from_size_align_unchecked(curr_cap, 4) };
             let new_layout = unsafe { alloc::Layout::from_size_align_unchecked(new_cap, 4) };
             
-            let new_ptr = unsafe { alloc::alloc(new_layout) };
-            unsafe { new_ptr.copy_from_nonoverlapping(self.pointer, curr_len) };
-            unsafe { alloc::dealloc(self.pointer, old_layout) };
+            unsafe {
+                self.pointer = alloc::realloc(self.pointer, new_layout, new_cap);
+            }
             
-            self.pointer = new_ptr;
             self.capacity = new_cap << 8;
         }
         
@@ -546,6 +544,13 @@ impl PartialOrd<String> for SsoString {
 impl PartialOrd<&str> for SsoString {
     fn partial_cmp(&self, other: &&str) -> Option<std::cmp::Ordering> {
         self.as_str().partial_cmp(other)
+    }
+}
+
+impl std::ops::Deref for SsoString {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
     }
 }
 
