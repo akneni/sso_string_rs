@@ -58,16 +58,15 @@ impl SsoStrMetadata {
     }
 
     #[inline]
-    #[allow(unused)]
     fn zero_flags(&mut self) {
-        self.data = self.data &0b000_11111;
+        self.data = self.data & 0b000_11111;
     }
 }
 
 
 impl SsoString {
-    const BIT_MASK_LOWER_U32_24: u32 = 0xFFFFFF;
-    const BIT_MASK_LOWER_U64_56: u64 = 0xFFFFFFFFFFFFFF;
+    const BIT_MASK_UPPER_U32_24: u32 = 0xFFFFFF00;
+    const BIT_MASK_UPPER_U64_56: u64 = 0xFFFFFFFFFFFFFF00;
 
     const INLINE_CAPACITY: usize = 23;
 
@@ -78,7 +77,7 @@ impl SsoString {
                 .unwrap();
     
             let string = SsoString { 
-                capacity: s.len(), 
+                capacity: s.len() << 8, 
                 length: s.len(), 
                 pointer: unsafe { alloc(layout) } 
             };
@@ -111,7 +110,7 @@ impl SsoString {
     #[inline]
     pub unsafe fn from_static_unchecked(s: &str) -> Self {
         let mut string = SsoString { 
-            capacity: s.len(), 
+            capacity: s.len() << 8, 
             length: s.len(), 
             pointer: s.as_ptr() as *mut u8,
         };
@@ -136,17 +135,7 @@ impl SsoString {
         if self.is_inlined() {
             return Self::INLINE_CAPACITY;
         }
-
-        match mem::size_of::<usize>() {
-            4 => {
-                self.capacity & Self::BIT_MASK_LOWER_U32_24 as usize
-            }
-            8 => {
-                self.capacity & Self::BIT_MASK_LOWER_U64_56 as usize
-            }
-            _ => unsafe { hint::unreachable_unchecked() },
-        }
-
+        self.capacity >> 8
     }
 
     #[inline]
@@ -212,7 +201,8 @@ impl SsoString {
     }
 
     pub fn reserve(&mut self, additional: usize) {
-        let new_capacity = self.capacity() + additional;
+        let curr_capacity = self.capacity();
+        let new_capacity = curr_capacity + additional;
         let reallocated = self.force_heap_relocation(new_capacity);
         if !reallocated {
             let layout = alloc::Layout::from_size_align(new_capacity, 4)
@@ -222,7 +212,7 @@ impl SsoString {
                 ptr.copy_from_nonoverlapping(self.pointer, self.len());
                 alloc::dealloc(
                     self.pointer, 
-                    alloc::Layout::from_size_align(self.capacity(), 4).unwrap()
+                    alloc::Layout::from_size_align(curr_capacity, 4).unwrap()
                 );
             }
             self.pointer = ptr;
@@ -356,8 +346,13 @@ impl SsoString {
 
     #[inline]
     fn set_capacity(&mut self, capacity: usize) {
-        self.capacity = self.capacity & (!Self::BIT_MASK_LOWER_U64_56 as usize);
-        self.capacity = self.capacity | capacity;
+        match mem::size_of::<usize>() {
+            4 => self.capacity = self.capacity & (!Self::BIT_MASK_UPPER_U32_24 as usize),
+            8 => self.capacity = self.capacity & (!Self::BIT_MASK_UPPER_U64_56 as usize),
+            _ => unsafe { hint::unreachable_unchecked() }
+        }
+        
+        self.capacity = self.capacity | (capacity << 8);
     }
 
     #[inline]
@@ -377,9 +372,7 @@ impl SsoString {
         let ptr = unsafe { alloc::alloc(layout) };
 
         self.set_capacity(capacity);
-
-        let md = self.metadata_mut();
-        md.zero_flags();
+        self.metadata_mut().zero_flags();
 
         self.length = placeholder.len();
         self.pointer = ptr;
