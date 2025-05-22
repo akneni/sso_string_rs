@@ -9,4 +9,28 @@
 * **Heap Allocation for Larger Strings:** When strings grow beyond the inline capacity, `SsoString` seamlessly transitions to allocating memory on the heap, much like the standard `std::string::String`.
 * **Familiar API (Work in Progress):** We're working towards an API that's largely compatible with `std::string::String`. The goal is to make it easy to integrate `SsoString` into your projects and use it with a familiar set of operations.
 
-If your application handles many small strings or works extensively with static text, `SsoString` could offer a noticeable performance boost by reducing memory allocation overhead and minimizing data copying.
+## Benchmarks (WIP)
+```
+all  < 23 characters
+=================================
+::from(&str) | 10000000 strings | 
+SsoString:    212.205795ms
+String:       483.236403ms
+=================================
+
+
+half < 23 characters
+=================================
+::from(&str) | 10000000 strings | 
+SsoString:    444.888287ms
+String:       535.229909ms
+=================================
+
+
+none < 23 characters
+=================================
+::from(&str) | 10000000 strings | 
+SsoString:    546.560462ms
+String:       548.85813ms
+=================================
+```
