@@ -1,7 +1,7 @@
 use std::{alloc::{self, alloc}, fmt, hash::Hash, hint, mem, slice, str};
 
 /// Bits 0-4: Length of the string (if inlined)
-/// Bit 5: IS_ASCII. Not yet used, but may allow us to make optimizations if we can assert that string only contains ascii characters. 
+/// Bit 5: Empty (reserved for future use??)
 /// Bit 6: flag IS_STATIC. Any operations requiring mutable state need to copy the underlying data if this bit is set to 1 (this flag is irrelevent for inlined strings). Enables us to do CoW optimizations. 
 /// Bit 7: IS_INLINED. 
 struct SsoStrMetadata {
@@ -25,12 +25,6 @@ impl SsoStrMetadata {
     }
 
     #[inline]
-    #[allow(unused)]
-    fn is_ascii(&self) -> bool {
-        (self.data & 0b001_00000) >> 5 == 1
-    }
-
-    #[inline]
     fn is_static(&self) -> bool {
         (self.data & 0b010_00000) >> 6 == 1
     }
@@ -44,13 +38,6 @@ impl SsoStrMetadata {
     fn set_inline_len(&mut self, length: u8) {
         self.data = self.data & 0b111_00000;
         self.data = self.data | length;
-    }
-
-    #[inline]
-    #[allow(unused)]
-    fn set_is_ascii(&mut self, flag: u8) {
-        self.data = self.data & 0b110_11111;
-        self.data = self.data | (flag << 5);
     }
 
     #[inline]
@@ -116,30 +103,23 @@ impl SsoString {
         string
     }
 
+    #[inline]
     pub fn from_static(s: &'static str) -> Self {
-        if s.len() > Self::INLINE_CAPACITY {    
-            let mut string = SsoString { 
-                capacity: s.len(), 
-                length: s.len(), 
-                pointer: s.as_ptr() as *mut u8,
-            };
+        unsafe { Self::from_static_unchecked(s) }
+    }
 
-            let md = string.metadata_mut();
-            md.set_is_static(1);
+    #[inline]
+    pub unsafe fn from_static_unchecked(s: &str) -> Self {
+        let mut string = SsoString { 
+            capacity: s.len(), 
+            length: s.len(), 
+            pointer: s.as_ptr() as *mut u8,
+        };
 
-            return string;
-        }
+        let md = string.metadata_mut();
+        md.set_is_static(1);
 
-        let mut string = Self::null_string();
-        let metadata = string.metadata_mut();
-        metadata.zero_all();
-        metadata.set_inline_len(s.len() as u8);
-        metadata.set_is_inlined(1);
-        
-        let ptr = string.inline_ptr_mut();
-        unsafe { ptr.copy_from_nonoverlapping(s.as_ptr(), s.len()) };
-
-        string
+        return string;
     }
 
     #[inline]
@@ -175,37 +155,56 @@ impl SsoString {
     }
 
     pub fn push_str(&mut self, s: &str) {
-        let new_length = self.len() + s.len();
+        let s_len = s.len();
+        let self_len = self.len();
+        let new_length = self_len + s_len;
 
-        if self.is_inlined() && new_length <= Self::INLINE_CAPACITY {
-            let ptr = unsafe { self.inline_ptr_mut().add(self.len()) };
+        let md = self.metadata();
+
+        let is_inlined = md.is_inlined();
+        let is_static = md.is_static();
+        let fits_inline = new_length <= Self::INLINE_CAPACITY;
+
+        if is_inlined && fits_inline {
+            let ptr = unsafe { self.inline_ptr_mut().add(self_len) };
             unsafe {
-                ptr.copy_from_nonoverlapping(s.as_ptr(), s.len());
+                ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
             }
             self.metadata_mut().set_inline_len(new_length as u8);
         }
-        else if self.is_inlined() || self.metadata().is_static() {
+        else if is_static && fits_inline {
+            let static_ptr = self.pointer as *const u8;
+
+            let inline_ptr = self.inline_ptr_mut();
+            unsafe {
+                inline_ptr.copy_from_nonoverlapping(static_ptr, self_len);
+                inline_ptr.add(self_len).copy_from_nonoverlapping(s.as_ptr(), s_len);
+            }
+            let md = self.metadata_mut();
+            md.data = 0b100_00000 | new_length as u8;
+        }
+        else if is_inlined || is_static {
             self.force_heap_relocation(new_length * 3 / 2);
-            let ptr = unsafe { self.pointer.add(self.len()) };
+            let ptr = unsafe { self.pointer.add(self_len) };
 
             unsafe {
-                ptr.copy_from_nonoverlapping(s.as_ptr(), s.len());
+                ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
             }
             self.length = new_length;
         }
         else if new_length > self.capacity() {
             let new_capacity = new_length * 3 / 2;
             self.reserve(new_capacity - self.capacity());
-            let ptr = unsafe { self.pointer.add(self.len()) };
+            let ptr = unsafe { self.pointer.add(self_len) };
             unsafe {
-                ptr.copy_from_nonoverlapping(s.as_ptr(), s.len());
+                ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
             }
             self.length = new_length;
         }
         else {
-            let ptr = unsafe { self.pointer.add(self.len()) };
+            let ptr = unsafe { self.pointer.add(self_len) };
             unsafe {
-                ptr.copy_from_nonoverlapping(s.as_ptr(), s.len());
+                ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
             }
             self.length = new_length;
         }
@@ -282,10 +281,6 @@ impl SsoString {
         } else {
             self.pointer
         }
-
-        // let arr = [self.pointer, self.inline_ptr()];
-        // let idx = (self.metadata().data & 0b100_00000) >> 7;
-        // arr[idx as usize]
     }
 
     #[inline]
@@ -315,8 +310,19 @@ impl SsoString {
 
     #[inline]
     pub fn as_str<'a>(&'a self) -> &'a str {
-        let bytes = self.as_bytes();
-        unsafe { std::str::from_utf8_unchecked(bytes) }
+        let md = self.metadata();
+        unsafe  {
+            if md.is_inlined() {
+                std::str::from_utf8_unchecked(
+                    std::slice::from_raw_parts(self.inline_ptr(), md.inline_len() as usize)
+                )
+            }
+            else {
+                std::str::from_utf8_unchecked(
+                    std::slice::from_raw_parts(self.pointer, self.length)
+                )
+            }
+        }
     }
 
     pub fn to_string(&self) -> String {
@@ -371,18 +377,14 @@ impl SsoString {
         let ptr = unsafe { alloc::alloc(layout) };
 
         self.set_capacity(capacity);
-        self.metadata_mut().set_is_inlined(0);
-        self.metadata_mut().set_is_static(0);
+
+        let md = self.metadata_mut();
+        md.zero_flags();
 
         self.length = placeholder.len();
         self.pointer = ptr;
 
-        let src_pointer = if placeholder.is_inlined() {
-            placeholder.inline_ptr()
-        } else {
-            placeholder.pointer
-        };
-
+        let src_pointer = placeholder.as_ptr();
         unsafe { 
             ptr.copy_from_nonoverlapping(src_pointer, placeholder.len()) 
         };
@@ -538,10 +540,9 @@ mod private_tests {
     fn test_from_static() {
         let static_str_short_literal = "static short";
         let s_static_inline = SsoString::from_static(static_str_short_literal);
-        assert!(s_static_inline.is_inlined());
+        assert!(s_static_inline.metadata().is_static());
         assert_eq!(s_static_inline.len(), static_str_short_literal.len());
         assert_eq!(s_static_inline.as_str(), static_str_short_literal);
-        assert_eq!(s_static_inline.metadata().is_static(), false);
 
         let static_str_long_literal = "this is a longer static string that will exceed inline capacity for sure";
         let s_static_heap = SsoString::from_static(static_str_long_literal);

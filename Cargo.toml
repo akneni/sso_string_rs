@@ -1,6 +1,6 @@
 [package]
 name = "sso_string"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "An API compatible string type in rust that implements short string and copy-on-write optimizations"
 license = "MIT"
