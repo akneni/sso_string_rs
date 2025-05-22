@@ -73,8 +73,7 @@ impl SsoString {
     pub fn from(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         if s.len() > Self::INLINE_CAPACITY {
-            let layout = alloc::Layout::from_size_align(s.len(), 4)
-                .unwrap();
+            let layout = unsafe { alloc::Layout::from_size_align_unchecked(s.len(), 4) };
     
             let string = SsoString { 
                 capacity: s.len() << 8, 
@@ -145,59 +144,92 @@ impl SsoString {
 
     pub fn push_str(&mut self, s: &str) {
         let s_len = s.len();
-        let self_len = self.len();
-        let new_length = self_len + s_len;
-
-        let md = self.metadata();
-
-        let is_inlined = md.is_inlined();
-        let is_static = md.is_static();
-        let fits_inline = new_length <= Self::INLINE_CAPACITY;
-
-        if is_inlined && fits_inline {
-            let ptr = unsafe { self.inline_ptr_mut().add(self_len) };
-            unsafe {
-                ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
+        let s_ptr = s.as_ptr();
+        
+        // Cache metadata access - this is expensive due to pointer casting
+        let md_data = unsafe { (self as *mut SsoString as *mut u8).read() };
+        let is_inlined = (md_data & 0b100_00000) != 0;
+        
+        if is_inlined {
+            let curr_len = (md_data & 0b000_11111) as usize;
+            let new_len = curr_len + s_len;
+            
+            if new_len <= Self::INLINE_CAPACITY {
+                // Fast path: inline to inline
+                let dst = unsafe { (self as *mut SsoString as *mut u8).add(1).add(curr_len) };
+                unsafe { dst.copy_from_nonoverlapping(s_ptr, s_len) };
+                unsafe { (self as *mut SsoString as *mut u8).write(0b100_00000 | new_len as u8) };
+                return;
             }
-            self.metadata_mut().set_inline_len(new_length as u8);
+            
+            // Inline to heap transition
+            let new_cap = (new_len * 3) >> 1; // Faster than division
+            let layout = unsafe { alloc::Layout::from_size_align_unchecked(new_cap, 4) };
+            let new_ptr = unsafe { alloc::alloc(layout) };
+            
+            // Copy existing inline data
+            let src = unsafe { (self as *const SsoString as *const u8).add(1) };
+            unsafe { new_ptr.copy_from_nonoverlapping(src, curr_len) };
+            // Append new data
+            unsafe { new_ptr.add(curr_len).copy_from_nonoverlapping(s_ptr, s_len) };
+            
+            self.capacity = new_cap << 8;
+            self.length = new_len;
+            self.pointer = new_ptr;
+            return;
         }
-        else if is_static && fits_inline {
-            let static_ptr = self.pointer as *const u8;
-
-            let inline_ptr = self.inline_ptr_mut();
-            unsafe {
-                inline_ptr.copy_from_nonoverlapping(static_ptr, self_len);
-                inline_ptr.add(self_len).copy_from_nonoverlapping(s.as_ptr(), s_len);
+        
+        // Heap-allocated path
+        let is_static = (md_data & 0b010_00000) != 0;
+        let curr_len = self.length;
+        let new_len = curr_len + s_len;
+        
+        if is_static {
+            let fits_inline = new_len <= Self::INLINE_CAPACITY;
+            
+            if fits_inline {
+                // Static to inline
+                let dst = unsafe { (self as *mut SsoString as *mut u8).add(1) };
+                unsafe { dst.copy_from_nonoverlapping(self.pointer, curr_len) };
+                unsafe { dst.add(curr_len).copy_from_nonoverlapping(s_ptr, s_len) };
+                unsafe { (self as *mut SsoString as *mut u8).write(0b100_00000 | new_len as u8) };
+                return;
             }
-            let md = self.metadata_mut();
-            md.data = 0b100_00000 | new_length as u8;
+            
+            // Static to heap
+            let new_cap = (new_len * 3) >> 1;
+            let layout = unsafe { alloc::Layout::from_size_align_unchecked(new_cap, 4) };
+            let new_ptr = unsafe { alloc::alloc(layout) };
+            
+            unsafe { new_ptr.copy_from_nonoverlapping(self.pointer, curr_len) };
+            unsafe { new_ptr.add(curr_len).copy_from_nonoverlapping(s_ptr, s_len) };
+            
+            self.capacity = new_cap << 8;
+            self.length = new_len;
+            self.pointer = new_ptr;
+            return;
         }
-        else if is_inlined || is_static {
-            self.force_heap_relocation(new_length * 3 / 2);
-            let ptr = unsafe { self.pointer.add(self_len) };
-
-            unsafe {
-                ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
-            }
-            self.length = new_length;
+        
+        // Mutable heap path
+        let curr_cap = self.capacity >> 8;
+        
+        if new_len > curr_cap {
+            // Need reallocation
+            let new_cap = (new_len * 3) >> 1;
+            let old_layout = unsafe { alloc::Layout::from_size_align_unchecked(curr_cap, 4) };
+            let new_layout = unsafe { alloc::Layout::from_size_align_unchecked(new_cap, 4) };
+            
+            let new_ptr = unsafe { alloc::alloc(new_layout) };
+            unsafe { new_ptr.copy_from_nonoverlapping(self.pointer, curr_len) };
+            unsafe { alloc::dealloc(self.pointer, old_layout) };
+            
+            self.pointer = new_ptr;
+            self.capacity = new_cap << 8;
         }
-        else if new_length > self.capacity() {
-            let new_capacity = new_length * 3 / 2;
-            self.reserve(new_capacity - self.capacity());
-            let ptr = unsafe { self.pointer.add(self_len) };
-            unsafe {
-                ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
-            }
-            self.length = new_length;
-        }
-        else {
-            let ptr = unsafe { self.pointer.add(self_len) };
-            unsafe {
-                ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
-            }
-            self.length = new_length;
-        }
-
+        
+        // Append new data
+        unsafe { self.pointer.add(curr_len).copy_from_nonoverlapping(s_ptr, s_len) };
+        self.length = new_len;
     }
 
     pub fn reserve(&mut self, additional: usize) {
@@ -205,17 +237,11 @@ impl SsoString {
         let new_capacity = curr_capacity + additional;
         let reallocated = self.force_heap_relocation(new_capacity);
         if !reallocated {
-            let layout = alloc::Layout::from_size_align(new_capacity, 4)
-                .unwrap();
-            let ptr = unsafe { alloc::alloc(layout) };
+            let layout = unsafe { alloc::Layout::from_size_align_unchecked(new_capacity, 4) };
+               
             unsafe {
-                ptr.copy_from_nonoverlapping(self.pointer, self.len());
-                alloc::dealloc(
-                    self.pointer, 
-                    alloc::Layout::from_size_align(curr_capacity, 4).unwrap()
-                );
+                self.pointer = alloc::realloc(self.pointer, layout, new_capacity);
             }
-            self.pointer = ptr;
             self.set_capacity(new_capacity);
         }
     }
@@ -300,11 +326,11 @@ impl SsoString {
 
     #[inline]
     pub fn as_str<'a>(&'a self) -> &'a str {
-        let md = self.metadata();
+        let md = self.metadata().data;
         unsafe  {
-            if md.is_inlined() {
+            if md >> 7 == 1{
                 std::str::from_utf8_unchecked(
-                    std::slice::from_raw_parts(self.inline_ptr(), md.inline_len() as usize)
+                    std::slice::from_raw_parts(self.inline_ptr(), (md & 0b000_11111) as usize)
                 )
             }
             else {
@@ -312,6 +338,25 @@ impl SsoString {
                     std::slice::from_raw_parts(self.pointer, self.length)
                 )
             }
+        }
+    }
+
+    /// Only call this if you KNOW the string is inlined
+    #[inline]
+    pub unsafe fn as_str_inline_unchecked<'a>(&'a self) -> &'a str {
+        unsafe {
+            let md = (self as *const SsoString as *const u8).read();
+            let ptr = (self as *const SsoString as *const u8).add(1);
+            let len = (md & 0b000_11111) as usize;
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
+        }
+    }
+
+    /// Only call this if you KNOW the string is not stored inline
+    #[inline]
+    pub unsafe fn as_str_outofline_unchecked<'a>(&'a self) -> &'a str {
+        unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.pointer, self.length))
         }
     }
 
@@ -357,7 +402,8 @@ impl SsoString {
 
     #[inline]
     fn is_heap_allocated(&self) -> bool {
-        !self.is_inlined() && !self.metadata().is_static()
+        let md = self.metadata().data;
+        md >> 6 == 0
     }
 
     /// Does nothing if the string is already heap-allocated.
@@ -420,18 +466,10 @@ impl fmt::Debug for SsoString {
 
 impl Clone for SsoString {
     fn clone(&self) -> Self {
-        let mut new_string: SsoString = SsoString::null_string();
-
-        unsafe {
-            (&mut new_string as *mut SsoString).copy_from_nonoverlapping(
-                self as *const SsoString,
-                1
-            );
-        }
-
+        let mut new_string: SsoString = unsafe { (self as *const SsoString).read() };
+        
         if self.is_heap_allocated()  {
-            let layout = alloc::Layout::from_size_align(self.capacity(), 4)
-                .unwrap();
+            let layout = unsafe { alloc::Layout::from_size_align_unchecked(self.capacity(), 4) };
             let ptr = unsafe { alloc::alloc(layout) };
             unsafe { ptr.copy_from_nonoverlapping(self.pointer, self.len()) };
             new_string.pointer = ptr;
@@ -443,8 +481,7 @@ impl Clone for SsoString {
 impl Drop for SsoString {
     fn drop(&mut self) {
         if self.is_heap_allocated() {
-            let layout = alloc::Layout::from_size_align(self.capacity(), 4)
-                .unwrap();
+            let layout = unsafe { alloc::Layout::from_size_align_unchecked(self.capacity(), 4) };
             unsafe { alloc::dealloc(self.pointer, layout) };
         }
     }
