@@ -2,5 +2,8 @@
 name = "sso_string"
 version = "0.1.0"
 edition = "2024"
+description = "An API compatible string type in rust that implements short string and copy-on-write optimizations"
+license = "MIT"
+repository = "https://github.com/akneni/sso_string_rs"  # optional but recommended
 
 [dependencies]
