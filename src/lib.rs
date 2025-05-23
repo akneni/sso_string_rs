@@ -1,4 +1,46 @@
-use std::{alloc::{self, Layout}, fmt, hash::Hash, hint, mem, slice, str};
+use std::{alloc::{self, Layout}, fmt::{self, Debug}, hash::Hash, hint, mem, slice, str};
+
+#[derive(Debug, Clone, Copy)]
+pub enum SsosPrecond {
+    Inline,
+    InlineAssumeCapacity,
+    Static,
+    Heap,
+    HeapAssumeCapacity,
+    Ascii,
+}
+
+/// SsoString Precondition
+impl SsosPrecond {
+    const fn from(num: SsosPrecondType) -> Self {
+        match num {
+            0 => Self::Inline,
+            1 => Self::InlineAssumeCapacity,
+            2 => Self::Static,
+            3 => Self::Heap,
+            4 => Self::HeapAssumeCapacity,
+            5 => Self::Ascii,
+            _ => panic!("invalid integer"),
+        }
+    }
+    
+    pub const fn into_param(&self) -> SsosPrecondType {
+        match self {
+            Self::Inline => 0,
+            Self::InlineAssumeCapacity => 1,
+            Self::Static => 2,
+            Self::Heap => 3,
+            Self::HeapAssumeCapacity => 4,
+            Self::Ascii => 5,
+        }
+    }
+}
+
+/// SsoString Precondition Type
+pub type SsosPrecondType = u32;
+
+
+
 
 /// Bits 0-4: Length of the string (if inlined)
 /// Bit 5: Empty (reserved for future use??)
@@ -70,6 +112,11 @@ impl SsoString {
 
     const INLINE_CAPACITY: usize = 23;
 
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn from(s: impl AsRef<str>) -> Self {
         let s = s.as_ref();
         if s.len() > Self::INLINE_CAPACITY {
@@ -120,6 +167,32 @@ impl SsoString {
         return string;
     }
 
+    pub fn from_utf8(bytes: Vec<u8>) -> Result<Self, str::Utf8Error> {
+        match std::str::from_utf8(&bytes) {
+            Ok(_) => {
+                let string = unsafe { Self::from_utf8_unchecked(bytes) };
+                Ok(string)
+            }
+            Err(e) => {
+                Err(e)
+            }
+        }
+    }
+    
+    #[inline]
+    pub unsafe fn from_utf8_unchecked(bytes: Vec<u8>) -> Self {
+        let len = bytes.len();
+        let capacity = bytes.capacity();
+
+        let mut md_bytes = mem::ManuallyDrop::new(bytes);
+
+        SsoString {
+            pointer: md_bytes.as_mut_ptr(),
+            length: len,
+            capacity: capacity << 8,
+        }
+    }
+
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
         let layout = unsafe {
@@ -154,6 +227,12 @@ impl SsoString {
     pub fn is_inlined(&self) -> bool {
         self.metadata().is_inlined()
     }
+
+    #[inline]
+    pub fn is_static(&self) -> bool {
+        self.metadata().is_static()
+    }
+
 
     pub fn push_str(&mut self, s: &str) {
         let s_len = s.len();
@@ -243,6 +322,94 @@ impl SsoString {
         self.length = new_len;
     }
 
+    /// Assumption is about the current state of the string, not the state after the operation
+    /// Ideally, the value passed to `assumption` should be a literal or const value to allow for constant folding
+    pub unsafe fn push_str_assume<const PRECOND: SsosPrecondType>(&mut self, s: &str) {
+        let s_len = s.len();
+        let s_ptr = s.as_ptr();
+
+        let assumption = SsosPrecond::from(PRECOND);
+        match assumption {
+            SsosPrecond::Inline => {
+                let md = self.metadata();
+                let length = md.inline_len() as usize;
+                let new_length = length + s_len;
+                if new_length > Self::INLINE_CAPACITY {
+                    self.force_heap_relocation((new_length * 3) >> 1);
+                    unsafe {
+                        let ptr = self.pointer.add(length);
+                        ptr.copy_from_nonoverlapping(s_ptr, s_len);
+                        self.length = new_length;
+                    }
+                }
+                else {
+                    unsafe {
+                        let ptr = self.inline_ptr_mut().add(length);
+                        ptr.copy_from_nonoverlapping(s_ptr, s_len);
+                        self.metadata_mut().set_inline_len(new_length as u8);
+                    }
+                }
+            }
+            SsosPrecond::InlineAssumeCapacity => {
+                let md = self.metadata();
+                let length = md.inline_len() as usize;
+                let new_length = length + s_len;
+                unsafe {
+                    let ptr = self.inline_ptr_mut().add(length);
+                    ptr.copy_from_nonoverlapping(s.as_ptr(), s_len);
+                    self.metadata_mut().set_inline_len(new_length as u8);
+                }
+            }
+            SsosPrecond::Static => {
+                let new_length = self.length + s_len;
+                let new_capacity = (new_length * 3) >> 1;
+
+                unsafe {
+                    let layout = Layout::from_size_align_unchecked(new_capacity, 4);
+                    let ptr = alloc::alloc(layout);
+                    ptr.copy_from_nonoverlapping(self.pointer, self.length);
+                    ptr.add(self.length).copy_from_nonoverlapping(s_ptr, s_len);
+                    self.pointer = ptr;
+                }
+                self.capacity = new_capacity << 8;
+                self.length = new_length;
+            }
+            SsosPrecond::Heap => {
+                let new_length = self.length + s_len;
+                let capacity = self.capacity >> 8;
+                if new_length > capacity {
+                    let new_capacity = (capacity * 3) >> 1;
+                    unsafe {
+                        let layout = Layout::from_size_align_unchecked(new_capacity, 4);
+                        self.pointer = alloc::realloc(self.pointer, layout, new_capacity);
+                    }
+                    self.capacity = new_capacity << 8;
+                }
+                unsafe {
+                    self.pointer
+                        .add(self.length)
+                        .copy_from_nonoverlapping(s_ptr, s_len);
+                }
+                self.length += s_len;
+            }
+            SsosPrecond::HeapAssumeCapacity => {
+                unsafe {
+                    self.pointer
+                        .add(self.length)
+                        .copy_from_nonoverlapping(s_ptr, s_len);
+                }
+                self.length += s_len;
+            }
+            _ => panic!("{:?} assumption isn't relevent in this context", assumption),
+        }
+    }
+    
+    pub fn push(&mut self, c: char) {
+        let mut buf = [0u8; 4];
+        let s_char = c.encode_utf8(&mut buf);
+        self.push_str(s_char);
+    }
+
     pub fn reserve(&mut self, additional: usize) {
         let curr_capacity = self.capacity();
         let new_capacity = curr_capacity + additional;
@@ -302,6 +469,11 @@ impl SsoString {
     }
 
     #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         if self.is_inlined() {
             self.inline_ptr()
@@ -352,22 +524,27 @@ impl SsoString {
         }
     }
 
-    /// Only call this if you KNOW the string is inlined
     #[inline]
-    pub unsafe fn as_str_inline_unchecked<'a>(&'a self) -> &'a str {
-        unsafe {
-            let md = (self as *const SsoString as *const u8).read();
-            let ptr = (self as *const SsoString as *const u8).add(1);
-            let len = (md & 0b000_11111) as usize;
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
-        }
-    }
-
-    /// Only call this if you KNOW the string is not stored inline
-    #[inline]
-    pub unsafe fn as_str_outofline_unchecked<'a>(&'a self) -> &'a str {
-        unsafe {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.pointer, self.length))
+    pub unsafe fn as_str_assume<'a, const PRECOND: SsosPrecondType>(&'a self) -> &'a str {
+        let assumption= SsosPrecond::from(PRECOND);
+        match assumption {
+            SsosPrecond::Heap |
+            SsosPrecond::HeapAssumeCapacity |
+            SsosPrecond::Static => {
+                unsafe {
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(self.pointer, self.length))
+                }
+            }
+            SsosPrecond::Inline |
+            SsosPrecond::InlineAssumeCapacity => {
+                unsafe {
+                    let md = (self as *const SsoString as *const u8).read();
+                    let ptr = (self as *const SsoString as *const u8).add(1);
+                    let len = (md & 0b000_11111) as usize;
+                    std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
+                }
+            }
+            _ => panic!("{:?} assumption isn't relevent in this context", assumption),
         }
     }
 

@@ -1,4 +1,4 @@
-use sso_string::SsoString;
+use sso_string::{SsoString, SsosPrecond};
 
 #[cfg(test)]
 mod correctness_tests {
@@ -296,5 +296,155 @@ mod correctness_tests {
         s_static.push_str(other_str_literal);
         assert_eq!(s_static.len(), s2_std.len());
         assert_eq!(s_static.as_str(), s2_std.as_str());
+    }
+
+    #[test]
+    fn test_push_assume_inline_fits() {
+        let mut s = SsoString::from("hello");
+        assert!(s.is_inlined());
+        unsafe { s.push_str_assume::<{SsosPrecond::Inline.into_param()}>(" world") };
+        assert!(s.is_inlined());
+        assert_eq!(s.as_str(), "hello world");
+        assert_eq!(s.len(), 11);
+    }
+
+    #[test]
+    fn test_push_assume_inline_to_heap() {
+        let mut s = SsoString::from("short"); // 5 chars
+        let to_push = "_this_will_make_it_long_enough_for_heap"; // 39 chars
+        assert!(s.is_inlined());
+        unsafe { s.push_str_assume::<{SsosPrecond::Inline.into_param()}>(to_push) };
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        assert_eq!(s.as_str(), "short_this_will_make_it_long_enough_for_heap");
+        assert_eq!(s.len(), 5 + 39);
+        assert!(s.capacity() >= 5 + 39);
+    }
+
+    #[test]
+    fn test_push_assume_inline_assume_capacity_fits() {
+        let mut s = SsoString::from("data"); // 4 chars
+        let to_push = "123"; // 3 chars. Total 7. Fits INLINE_CAPACITY (23)
+        assert!(s.is_inlined());
+        // UNSAFE: Caller guarantees "data".len() + "123".len() <= INLINE_CAPACITY
+        unsafe { s.push_str_assume::<{SsosPrecond::InlineAssumeCapacity.into_param()}>(to_push) };
+        assert!(s.is_inlined());
+        assert_eq!(s.as_str(), "data123");
+        assert_eq!(s.len(), 7);
+    }
+
+    #[test]
+    fn test_push_assume_static_to_heap() {
+        static INITIAL_STATIC: &str = "this_is_a_static_string_on_the_heap"; // 38 chars, so not inlined
+        let mut s = SsoString::from_static(INITIAL_STATIC);
+        assert!(!s.is_inlined());
+        assert!(s.is_static());
+        let original_ptr = s.as_ptr();
+
+        let to_push = "_plus_more";
+        let expected_len = INITIAL_STATIC.len() + to_push.len();
+        
+        // UNSAFE: Assumes 's' is static and not inlined.
+        // The current implementation of Static branch in push_str_assume
+        // will allocate a new buffer, copy, and should update self.pointer.
+        unsafe { s.push_str_assume::<{SsosPrecond::Static.into_param()}>(to_push) };
+        
+        assert!(!s.is_inlined(), "Should be on heap after push from static");
+        assert!(!s.is_static(), "Should be mutable (not static) after push");
+        assert_eq!(s.len(), expected_len, "Length should be updated");
+        assert_ne!(s.as_ptr(), original_ptr, "Pointer should change to a new heap allocation");
+        assert_eq!(s.as_str(), String::from(INITIAL_STATIC) + to_push);
+        assert!(s.capacity() >= expected_len, "Capacity should be sufficient");
+    }
+
+
+    #[test]
+    fn test_push_assume_heap_fits_capacity() {
+        let initial_content = "heap_content_that_is_long"; // 27 chars > 23
+        let mut s = SsoString::from(initial_content); // Starts on heap
+        s.reserve(20); // Ensure extra capacity
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        let initial_cap = s.capacity();
+        let initial_ptr = s.as_ptr();
+
+        let to_push = "_add"; // 4 chars
+        // UNSAFE: Assumes 's' is heap allocated, not static.
+        // And that current_len + to_push.len() <= current_capacity
+        unsafe { s.push_str_assume::<{SsosPrecond::Heap.into_param()}>(to_push) };
+        
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        assert_eq!(s.as_str(), "heap_content_that_is_long_add");
+        assert_eq!(s.len(), initial_content.len() + to_push.len());
+        assert_eq!(s.capacity(), initial_cap, "Capacity should not change if it fits");
+        assert_eq!(s.as_ptr(), initial_ptr, "Pointer should not change if it fits capacity");
+    }
+
+    #[test]
+    fn test_push_assume_heap_needs_realloc() {
+        let initial_content = "realloc_heap_test_string_long_enough"; // 36 chars
+        let mut s = SsoString::from(initial_content); // Heap allocated, exact capacity
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        assert_eq!(s.capacity(), initial_content.len(), "Should have exact capacity initially");
+
+        let to_push = "_needs_realloc"; // 14 chars
+        let expected_len = initial_content.len() + to_push.len();
+        // UNSAFE: Assumes 's' is heap allocated, not static.
+        unsafe { s.push_str_assume::<{SsosPrecond::Heap.into_param()}>(to_push) };
+        
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        assert_eq!(s.as_str(), String::from(initial_content) + to_push);
+        assert_eq!(s.len(), expected_len);
+        assert!(s.capacity() >= expected_len, "Capacity should have increased");
+        // Pointer might or might not change depending on realloc behavior,
+        // but if capacity increased significantly, it likely changed.
+        // If it didn't change, realloc extended in place.
+    }
+
+    #[test]
+    fn test_push_assume_heap_assume_capacity_fits() {
+        let initial_content = "assume_cap_heap_content_long"; // 29 chars
+        let mut s = SsoString::from(initial_content);
+        s.reserve(10); // Ensure it has capacity: 29 + 10 = 39
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        let current_cap = s.capacity();
+        let original_ptr = s.as_ptr();
+
+        let to_push = "_fits"; // 5 chars. Total 34. Fits 39.
+        // UNSAFE: Caller guarantees 's' is heap, not static, and has capacity.
+        unsafe { s.push_str_assume::<{SsosPrecond::HeapAssumeCapacity.into_param()}>(to_push) };
+        
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        assert_eq!(s.as_str(), String::from(initial_content) + to_push);
+        assert_eq!(s.len(), initial_content.len() + to_push.len());
+        assert_eq!(s.capacity(), current_cap, "Capacity should remain the same");
+        assert_eq!(s.as_ptr(), original_ptr, "Pointer should remain the same");
+    }
+    
+    #[test]
+    fn test_with_capacity_zero() {
+        let s = SsoString::with_capacity(0);
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.capacity(), 0); // Capacity is 0
+        assert_eq!(s.as_str(), "");
+    }
+
+    #[test]
+    fn test_push_str_to_zero_capacity_heap() {
+        let mut s = SsoString::with_capacity(0);
+        assert_eq!(s.capacity(), 0);
+        s.push_str("hello");
+        assert!(!s.is_inlined());
+        assert!(!s.is_static());
+        assert_eq!(s.len(), 5);
+        assert_eq!(s.as_str(), "hello");
+        assert!(s.capacity() >= 5);
     }
 }
