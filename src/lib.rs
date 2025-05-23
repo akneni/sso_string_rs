@@ -693,6 +693,24 @@ impl Into<String> for SsoString {
     }
 }
 
+impl From<&'static str> for SsoString {
+    fn from(value: &'static str) -> Self {
+        Self::from_static(value)
+    }
+}
+
+impl From<String> for SsoString {
+    fn from(value: String) -> Self {
+        let mut value = mem::ManuallyDrop::new(value);
+
+        Self {
+            capacity: value.capacity() << 8,
+            length: value.len(),
+            pointer: value.as_mut_ptr(),
+        }
+    }
+}
+
 impl PartialEq for SsoString {
     fn eq(&self, other: &Self) -> bool {
         self.as_str() == other.as_str()
