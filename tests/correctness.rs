@@ -41,6 +41,69 @@ mod correctness_tests {
     }
 
     #[test]
+    fn test_from_static() {
+        let static_str_short_literal = "static short";
+        let s_static_inline = SsoString::from_static(static_str_short_literal);
+        assert!(s_static_inline.is_static());
+        assert_eq!(s_static_inline.len(), static_str_short_literal.len());
+        assert_eq!(s_static_inline.as_str(), static_str_short_literal);
+
+        let static_str_long_literal = "this is a longer static string that will exceed inline capacity for sure";
+        let s_static_heap = SsoString::from_static(static_str_long_literal);
+        assert!(!s_static_heap.is_inlined());
+        assert_eq!(s_static_heap.len(), static_str_long_literal.len());
+        assert_eq!(s_static_heap.as_str(), static_str_long_literal);
+        assert_eq!(s_static_heap.is_static(), true);
+    }
+
+    #[test]
+    fn test_push_str_static_heap_becomes_mutable_heap() {
+        let main_static_literal = "0123456789_0123456789_0123456789_static";
+        let to_push_literal = "_plus_this";
+        let mut s = SsoString::from_static(main_static_literal);
+        assert!(!s.is_inlined());
+        assert_eq!(s.is_static(), true, "Initially static heap");
+
+        s.push_str(to_push_literal);
+        assert!(!s.is_inlined(), "Should remain on heap");
+        assert_eq!(s.is_static(), false, "Should become non-static after push_str");
+        let expected_str_obj = String::from(main_static_literal) + to_push_literal;
+        assert_eq!(s.as_str(), expected_str_obj.as_str());
+        assert_eq!(s.len(), expected_str_obj.len());
+    }
+
+    #[test]
+    fn test_clone() {
+        let inline_literal = "clone_me_inline";
+        let s1_inline = SsoString::from(inline_literal);
+        let s2_inline = s1_inline.clone();
+        assert!(s2_inline.is_inlined());
+        assert_eq!(s1_inline.as_str(), s2_inline.as_str());
+        assert_eq!(s1_inline.len(), s2_inline.len());
+
+        let heap_literal = "clone_me_heap_because_i_am_a_long_string";
+        let s1_heap = SsoString::from(heap_literal);
+        let s2_heap = s1_heap.clone();
+        assert!(!s1_heap.is_inlined());
+        assert!(!s2_heap.is_inlined());
+        assert!(!s1_heap.is_static());
+        assert!(!s2_heap.is_static());
+        assert_eq!(s1_heap.as_str(), s2_heap.as_str());
+        assert_ne!(s1_heap.as_ptr(), s2_heap.as_ptr(), "Heap clone should have different pointer");
+
+        let static_data_literal = "clone_me_static_heap_long_string";
+        let s1_static_heap = SsoString::from_static(static_data_literal);
+        let s2_static_heap = s1_static_heap.clone();
+        assert!(!s2_static_heap.is_inlined());
+        assert_eq!(s1_static_heap.as_str(), s2_static_heap.as_str());
+        assert_eq!(s1_static_heap.is_static(), true);
+        assert_eq!(s2_static_heap.is_static(), true, "Clone of static string should also be marked static initially");
+        if s1_static_heap.as_ptr() != 0 as *mut u8 {
+             assert_eq!(s1_static_heap.as_ptr(), s2_static_heap.as_ptr(), "Clone of static heap string should share pointer until CoW");
+        }
+    }
+
+    #[test]
     fn test_push_str_inline_to_inline() {
         let initial_str = "hello";
         let to_push_str = " world";
@@ -105,7 +168,8 @@ mod correctness_tests {
         let mut s2 = s1.clone();
 
         s2.push_str(changed_literal_part);
-        assert_eq!(s1.as_str(), original_literal);
+        let a = s1.as_str();
+        assert_eq!(a, original_literal);
         assert_eq!(s2.as_str(), expected_changed_literal);
 
         let long_original_literal = "this is a long string that will be on the heap for sure";

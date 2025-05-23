@@ -51,9 +51,9 @@ struct SsoStrMetadata {
 }
 
 pub struct SsoString {
-    capacity: usize,
-    length: usize,
     pointer: *mut u8,
+    length: usize,
+    capacity: usize,
 }
 
 pub trait SsoStringable {
@@ -73,7 +73,7 @@ impl SsoStrMetadata {
 
     #[inline]
     fn is_inlined(&self) -> bool {
-        (self.data & 0b100_00000) >> 7 == 1
+        self.data >> 7 == 1
     }
 
     #[inline]
@@ -107,10 +107,11 @@ impl SsoStrMetadata {
 
 
 impl SsoString {
-    const BIT_MASK_UPPER_U32_24: u32 = 0xFFFFFF00;
-    const BIT_MASK_UPPER_U64_56: u64 = 0xFFFFFFFFFFFFFF00;
+    const BIT_MASK_LOWER_24: u32 = 0x00FFFFFF;
+    const BIT_MASK_LOWER_56: u64 = 0x00FFFFFFFFFFFFFF;
 
     const INLINE_CAPACITY: usize = 23;
+    const MD_OFFSET: usize = const { mem::size_of::<usize>() - 1 };
 
     #[inline]
     pub fn new() -> Self {
@@ -123,8 +124,8 @@ impl SsoString {
             let layout = unsafe { Layout::from_size_align_unchecked(s.len(), 4) };
     
             let string = SsoString { 
-                capacity: s.len() << 8, 
-                length: s.len(), 
+                capacity: s.len(), 
+                length: s.len(),
                 pointer: unsafe { alloc::alloc(layout) } 
             };
 
@@ -137,13 +138,11 @@ impl SsoString {
 
         let mut string = Self::null_string();
         let metadata = string.metadata_mut();
-        metadata.zero_all();
         metadata.set_inline_len(s.len() as u8);
         metadata.set_is_inlined(1);
         
         let ptr = string.inline_ptr_mut();
         unsafe { ptr.copy_from_nonoverlapping(s.as_ptr(), s.len()) };
-        
 
         string
     }
@@ -156,8 +155,8 @@ impl SsoString {
     #[inline]
     pub unsafe fn from_static_unchecked(s: &str) -> Self {
         let mut string = SsoString { 
-            capacity: s.len() << 8, 
-            length: s.len(), 
+            capacity: s.len(),
+            length: s.len(),
             pointer: s.as_ptr() as *mut u8,
         };
 
@@ -189,7 +188,7 @@ impl SsoString {
         SsoString {
             pointer: md_bytes.as_mut_ptr(),
             length: len,
-            capacity: capacity << 8,
+            capacity: capacity,
         }
     }
 
@@ -201,7 +200,7 @@ impl SsoString {
 
         Self {
             length: 0,
-            capacity: cap << 8,
+            capacity: cap,
             pointer: unsafe { alloc::alloc(layout) }
         }
     }
@@ -220,7 +219,12 @@ impl SsoString {
         if self.is_inlined() {
             return Self::INLINE_CAPACITY;
         }
-        self.capacity >> 8
+
+        match mem::size_of::<usize>() {
+            4 => self.capacity & Self::BIT_MASK_LOWER_24 as usize,
+            8 => self.capacity & Self::BIT_MASK_LOWER_56 as usize,
+            _ => unsafe { hint::unreachable_unchecked() }
+        }
     }
 
     #[inline]
@@ -233,13 +237,12 @@ impl SsoString {
         self.metadata().is_static()
     }
 
-
     pub fn push_str(&mut self, s: &str) {
         let s_len = s.len();
         let s_ptr = s.as_ptr();
         
         // Cache metadata access - this is expensive due to pointer casting
-        let md_data = unsafe { (self as *mut SsoString as *mut u8).read() };
+        let md_data = self.metadata().data;
         let is_inlined = (md_data & 0b100_00000) != 0;
         
         if is_inlined {
@@ -248,9 +251,9 @@ impl SsoString {
             
             if new_len <= Self::INLINE_CAPACITY {
                 // Fast path: inline to inline
-                let dst = unsafe { (self as *mut SsoString as *mut u8).add(1).add(curr_len) };
+                let dst = unsafe { self.inline_ptr_mut().add(curr_len) };
                 unsafe { dst.copy_from_nonoverlapping(s_ptr, s_len) };
-                unsafe { (self as *mut SsoString as *mut u8).write(0b100_00000 | new_len as u8) };
+                self.set_metadata(0b100_00000 | new_len);
                 return;
             }
             
@@ -260,12 +263,12 @@ impl SsoString {
             let new_ptr = unsafe { alloc::alloc(layout) };
             
             // Copy existing inline data
-            let src = unsafe { (self as *const SsoString as *const u8).add(1) };
+            let src = self.inline_ptr();
             unsafe { new_ptr.copy_from_nonoverlapping(src, curr_len) };
             // Append new data
             unsafe { new_ptr.add(curr_len).copy_from_nonoverlapping(s_ptr, s_len) };
             
-            self.capacity = new_cap << 8;
+            self.capacity = new_cap;
             self.length = new_len;
             self.pointer = new_ptr;
             return;
@@ -276,15 +279,13 @@ impl SsoString {
         let curr_len = self.length;
         let new_len = curr_len + s_len;
         
-        if is_static {
-            let fits_inline = new_len <= Self::INLINE_CAPACITY;
-            
-            if fits_inline {
+        if is_static {            
+            if new_len <= Self::INLINE_CAPACITY {
                 // Static to inline
-                let dst = unsafe { (self as *mut SsoString as *mut u8).add(1) };
+                let dst = self.inline_ptr_mut();
                 unsafe { dst.copy_from_nonoverlapping(self.pointer, curr_len) };
                 unsafe { dst.add(curr_len).copy_from_nonoverlapping(s_ptr, s_len) };
-                unsafe { (self as *mut SsoString as *mut u8).write(0b100_00000 | new_len as u8) };
+                self.set_metadata(0b100_00000 | new_len);
                 return;
             }
             
@@ -296,14 +297,14 @@ impl SsoString {
             unsafe { new_ptr.copy_from_nonoverlapping(self.pointer, curr_len) };
             unsafe { new_ptr.add(curr_len).copy_from_nonoverlapping(s_ptr, s_len) };
             
-            self.capacity = new_cap << 8;
+            self.capacity = new_cap;
             self.length = new_len;
             self.pointer = new_ptr;
             return;
         }
         
         // Mutable heap path
-        let curr_cap = self.capacity >> 8;
+        let curr_cap = self.capacity;
         
         if new_len > curr_cap {
             // Need reallocation
@@ -313,8 +314,7 @@ impl SsoString {
             unsafe {
                 self.pointer = alloc::realloc(self.pointer, new_layout, new_cap);
             }
-            
-            self.capacity = new_cap << 8;
+            self.capacity = new_cap;
         }
         
         // Append new data
@@ -371,19 +371,19 @@ impl SsoString {
                     ptr.add(self.length).copy_from_nonoverlapping(s_ptr, s_len);
                     self.pointer = ptr;
                 }
-                self.capacity = new_capacity << 8;
+                self.capacity = new_capacity;
                 self.length = new_length;
             }
             SsosPrecond::Heap => {
                 let new_length = self.length + s_len;
-                let capacity = self.capacity >> 8;
+                let capacity = self.capacity;
                 if new_length > capacity {
                     let new_capacity = (capacity * 3) >> 1;
                     unsafe {
                         let layout = Layout::from_size_align_unchecked(new_capacity, 4);
                         self.pointer = alloc::realloc(self.pointer, layout, new_capacity);
                     }
-                    self.capacity = new_capacity << 8;
+                    self.capacity = new_capacity;
                 }
                 unsafe {
                     self.pointer
@@ -509,9 +509,11 @@ impl SsoString {
 
     #[inline]
     pub fn as_str<'a>(&'a self) -> &'a str {
+        // str::from_utf8(self.as_bytes()).unwrap()
+
         let md = self.metadata().data;
         unsafe  {
-            if md >> 7 == 1{
+            if md >> 7 == 1 {
                 std::str::from_utf8_unchecked(
                     std::slice::from_raw_parts(self.inline_ptr(), (md & 0b000_11111) as usize)
                 )
@@ -539,7 +541,7 @@ impl SsoString {
             SsosPrecond::InlineAssumeCapacity => {
                 unsafe {
                     let md = (self as *const SsoString as *const u8).read();
-                    let ptr = (self as *const SsoString as *const u8).add(1);
+                    let ptr = self.inline_ptr();
                     let len = (md & 0b000_11111) as usize;
                     std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len))
                 }
@@ -554,38 +556,47 @@ impl SsoString {
 
     #[inline]
     fn metadata(&self) -> &SsoStrMetadata {
-        let metadata = self as *const SsoString as *const SsoStrMetadata;
-        unsafe { metadata.as_ref().unwrap_unchecked() }
+        let metadata = &self.capacity as *const usize as *const u8;
+        unsafe { (metadata.add(Self::MD_OFFSET) as *const SsoStrMetadata).as_ref().unwrap_unchecked() }
     }
 
 
     #[inline]
     fn metadata_mut(&mut self) -> &mut SsoStrMetadata {
-        let metadata = self as *mut SsoString as *mut SsoStrMetadata;
-        unsafe { metadata.as_mut().unwrap_unchecked() }
+        let metadata = &mut self.capacity as *mut usize as *mut u8;
+        unsafe { (metadata.add(Self::MD_OFFSET) as *mut SsoStrMetadata).as_mut().unwrap_unchecked() }
+    }
+
+    #[inline]
+    fn set_metadata(&mut self, md: usize) {
+        match mem::size_of::<usize>() {
+            4 => self.capacity = self.capacity & (Self::BIT_MASK_LOWER_24 as usize),
+            8 => self.capacity = self.capacity & (Self::BIT_MASK_LOWER_56 as usize),
+            _ => unsafe { hint::unreachable_unchecked() }
+        }
+
+        self.capacity = self.capacity | (md << (Self::MD_OFFSET * 8));
     }
 
     #[inline]
     fn inline_ptr(&self) -> *const u8 {
-        let ptr = self as *const SsoString as *const u8;
-        unsafe { ptr.add(1) }
+        self as *const Self as *const u8
     }
 
     #[inline]
     fn inline_ptr_mut(&mut self) -> *mut u8 {
-        let ptr = self as *mut SsoString as *mut u8;
-        unsafe { ptr.add(1) }
+        self as *mut Self as *mut u8
     }
 
     #[inline]
     fn set_capacity(&mut self, capacity: usize) {
         match mem::size_of::<usize>() {
-            4 => self.capacity = self.capacity & (!Self::BIT_MASK_UPPER_U32_24 as usize),
-            8 => self.capacity = self.capacity & (!Self::BIT_MASK_UPPER_U64_56 as usize),
+            4 => self.capacity = self.capacity & (!Self::BIT_MASK_LOWER_24 as usize),
+            8 => self.capacity = self.capacity & (!Self::BIT_MASK_LOWER_56 as usize),
             _ => unsafe { hint::unreachable_unchecked() }
         }
         
-        self.capacity = self.capacity | (capacity << 8);
+        self.capacity = self.capacity | capacity;
     }
 
     #[inline]
@@ -753,74 +764,5 @@ impl SsoStringable for String {
 impl SsoStringable for &str {
     fn to_sso_string(&self) -> SsoString {
         SsoString::from(self)
-    }
-}
-
-
-#[cfg(test)]
-mod private_tests {
-    use super::*;
-
-    #[test]
-    fn test_from_static() {
-        let static_str_short_literal = "static short";
-        let s_static_inline = SsoString::from_static(static_str_short_literal);
-        assert!(s_static_inline.metadata().is_static());
-        assert_eq!(s_static_inline.len(), static_str_short_literal.len());
-        assert_eq!(s_static_inline.as_str(), static_str_short_literal);
-
-        let static_str_long_literal = "this is a longer static string that will exceed inline capacity for sure";
-        let s_static_heap = SsoString::from_static(static_str_long_literal);
-        assert!(!s_static_heap.is_inlined());
-        assert_eq!(s_static_heap.len(), static_str_long_literal.len());
-        assert_eq!(s_static_heap.as_str(), static_str_long_literal);
-        assert_eq!(s_static_heap.metadata().is_static(), true);
-    }
-
-    #[test]
-    fn test_push_str_static_heap_becomes_mutable_heap() {
-        let main_static_literal = "0123456789_0123456789_0123456789_static";
-        let to_push_literal = "_plus_this";
-        let mut s = SsoString::from_static(main_static_literal);
-        assert!(!s.is_inlined());
-        assert_eq!(s.metadata().is_static(), true, "Initially static heap");
-
-        s.push_str(to_push_literal);
-        assert!(!s.is_inlined(), "Should remain on heap");
-        assert_eq!(s.metadata().is_static(), false, "Should become non-static after push_str");
-        let expected_str_obj = String::from(main_static_literal) + to_push_literal;
-        assert_eq!(s.as_str(), expected_str_obj.as_str());
-        assert_eq!(s.len(), expected_str_obj.len());
-    }
-
-    #[test]
-    fn test_clone() {
-        let inline_literal = "clone_me_inline";
-        let s1_inline = SsoString::from(inline_literal);
-        let s2_inline = s1_inline.clone();
-        assert!(s2_inline.is_inlined());
-        assert_eq!(s1_inline.as_str(), s2_inline.as_str());
-        assert_eq!(s1_inline.len(), s2_inline.len());
-
-        let heap_literal = "clone_me_heap_because_i_am_a_long_string";
-        let s1_heap = SsoString::from(heap_literal);
-        let s2_heap = s1_heap.clone();
-        assert!(!s1_heap.is_inlined());
-        assert!(!s2_heap.is_inlined());
-        assert!(!s1_heap.metadata().is_static());
-        assert!(!s2_heap.metadata().is_static());
-        assert_eq!(s1_heap.as_str(), s2_heap.as_str());
-        assert_ne!(s1_heap.pointer, s2_heap.pointer, "Heap clone should have different pointer");
-
-        let static_data_literal = "clone_me_static_heap_long_string";
-        let s1_static_heap = SsoString::from_static(static_data_literal);
-        let s2_static_heap = s1_static_heap.clone();
-        assert!(!s2_static_heap.is_inlined());
-        assert_eq!(s1_static_heap.as_str(), s2_static_heap.as_str());
-        assert_eq!(s1_static_heap.metadata().is_static(), true);
-        assert_eq!(s2_static_heap.metadata().is_static(), true, "Clone of static string should also be marked static initially");
-        if s1_static_heap.pointer != 0 as *mut u8 {
-             assert_eq!(s1_static_heap.pointer, s2_static_heap.pointer, "Clone of static heap string should share pointer until CoW");
-        }
     }
 }
