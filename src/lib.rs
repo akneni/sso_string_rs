@@ -95,6 +95,7 @@ impl SsoStrMetadata {
     }
 
     #[inline]
+    #[allow(unused)]
     fn zero_all(&mut self) {
         self.data = 0;
     }
@@ -701,6 +702,24 @@ impl AsRef<str> for SsoString {
 impl Into<String> for SsoString {
     fn into(self) -> String {
         self.to_string()
+    }
+}
+
+impl From<&'static str> for SsoString {
+    fn from(value: &'static str) -> Self {
+        Self::from_static(value)
+    }
+}
+
+impl From<String> for SsoString {
+    fn from(value: String) -> Self {
+        let mut value = mem::ManuallyDrop::new(value);
+
+        Self {
+            capacity: value.capacity(),
+            length: value.len(),
+            pointer: value.as_mut_ptr(),
+        }
     }
 }
 
