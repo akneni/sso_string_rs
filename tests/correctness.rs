@@ -511,4 +511,23 @@ mod correctness_tests {
         assert_eq!(s.as_str(), "hello");
         assert!(s.capacity() >= 5);
     }
+
+    #[test]
+    fn test_from_traits() {
+        let s1 = "short str";
+        let sso_string1 = SsoString::from(s1);
+        assert_eq!(sso_string1, s1);
+
+        let s2 = "some long string ----------------";
+        let sso_string2 = SsoString::from(s2);
+        assert_eq!(sso_string2, s2);
+
+        let s3 = String::from("short str");
+        let sso_string3 = SsoString::from(s3.clone());
+        assert_eq!(sso_string3, s3);
+
+        let s4 = String::from("some long string ----------------");
+        let sso_string4 = SsoString::from(s4.clone());
+        assert_eq!(sso_string4, s4);
+    }
 }
